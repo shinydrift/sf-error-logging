@@ -3,8 +3,9 @@
  *
  * Centralised DML utility that uses the Database class for granular control.
  * Partial success is the default for all operations — pass allOrNone=true to
- * override. Any record-level failures are persisted to Error_Log__c in the
- * same transaction before the results are returned to the caller.
+ * override. Any record-level failures are captured in a single Error_Log__c
+ * per method call, with the full record and error detail attached as a JSON
+ * ContentVersion file linked to the log record.
  */
 public without sharing class DmlService {
 
@@ -22,7 +23,7 @@ public without sharing class DmlService {
             return new List<Database.SaveResult>();
         }
         Database.SaveResult[] results = Database.insert(records, allOrNone);
-        logSaveFailures(records, results, OP_INSERT);
+        processSaveResults(records, results, OP_INSERT);
         return results;
     }
 
@@ -35,7 +36,7 @@ public without sharing class DmlService {
             return new List<Database.SaveResult>();
         }
         Database.SaveResult[] results = Database.update(records, allOrNone);
-        logSaveFailures(records, results, OP_UPDATE);
+        processSaveResults(records, results, OP_UPDATE);
         return results;
     }
 
@@ -48,7 +49,7 @@ public without sharing class DmlService {
             return new List<Database.UpsertResult>();
         }
         Database.UpsertResult[] results = Database.upsert(records, allOrNone);
-        logUpsertFailures(records, results, OP_UPSERT);
+        processUpsertResults(records, results, OP_UPSERT);
         return results;
     }
 
@@ -61,53 +62,154 @@ public without sharing class DmlService {
             return new List<Database.DeleteResult>();
         }
         Database.DeleteResult[] results = Database.delete(records, allOrNone);
-        logDeleteFailures(records, results, OP_DELETE);
+        processDeleteResults(records, results, OP_DELETE);
         return results;
     }
 
-    private static void logSaveFailures(
+    // ── Private helpers ───────────────────────────────────────────────────────
+
+    private static void processSaveResults(
         List<SObject> records,
         Database.SaveResult[] results,
         String operation
     ) {
-        List<Error_Log__c> logs = new List<Error_Log__c>();
+        List<SObject> failed = new List<SObject>();
+        List<Map<String, Object>> details = new List<Map<String, Object>>();
         Map<Schema.SObjectType, String> typeCache = new Map<Schema.SObjectType, String>();
+        String typeName = '';
+
         for (Integer i = 0; i < results.size(); i++) {
             if (!results[i].isSuccess()) {
-                logs.add(buildLog(records[i], resolveTypeName(records[i], typeCache), results[i].getErrors(), operation));
+                SObject rec = records[i];
+                if (String.isBlank(typeName)) {
+                    typeName = resolveTypeName(rec, typeCache);
+                }
+                failed.add(rec);
+                details.add(toErrorDetail(rec.Id, results[i].getErrors()));
             }
         }
-        persistLogs(logs);
+        if (!failed.isEmpty()) {
+            persistLog(typeName, operation, failed, details);
+        }
     }
 
-    private static void logUpsertFailures(
+    private static void processUpsertResults(
         List<SObject> records,
         Database.UpsertResult[] results,
         String operation
     ) {
-        List<Error_Log__c> logs = new List<Error_Log__c>();
+        List<SObject> failed = new List<SObject>();
+        List<Map<String, Object>> details = new List<Map<String, Object>>();
         Map<Schema.SObjectType, String> typeCache = new Map<Schema.SObjectType, String>();
+        String typeName = '';
+
         for (Integer i = 0; i < results.size(); i++) {
             if (!results[i].isSuccess()) {
-                logs.add(buildLog(records[i], resolveTypeName(records[i], typeCache), results[i].getErrors(), operation));
+                SObject rec = records[i];
+                if (String.isBlank(typeName)) {
+                    typeName = resolveTypeName(rec, typeCache);
+                }
+                failed.add(rec);
+                details.add(toErrorDetail(rec.Id, results[i].getErrors()));
             }
         }
-        persistLogs(logs);
+        if (!failed.isEmpty()) {
+            persistLog(typeName, operation, failed, details);
+        }
     }
 
-    private static void logDeleteFailures(
+    private static void processDeleteResults(
         List<SObject> records,
         Database.DeleteResult[] results,
         String operation
     ) {
-        List<Error_Log__c> logs = new List<Error_Log__c>();
+        List<SObject> failed = new List<SObject>();
+        List<Map<String, Object>> details = new List<Map<String, Object>>();
         Map<Schema.SObjectType, String> typeCache = new Map<Schema.SObjectType, String>();
+        String typeName = '';
+
         for (Integer i = 0; i < results.size(); i++) {
             if (!results[i].isSuccess()) {
-                logs.add(buildLog(records[i], resolveTypeName(records[i], typeCache), results[i].getErrors(), operation));
+                SObject rec = records[i];
+                if (String.isBlank(typeName)) {
+                    typeName = resolveTypeName(rec, typeCache);
+                }
+                failed.add(rec);
+                details.add(toErrorDetail(rec.Id, results[i].getErrors()));
             }
         }
-        persistLogs(logs);
+        if (!failed.isEmpty()) {
+            persistLog(typeName, operation, failed, details);
+        }
+    }
+
+    private static Map<String, Object> toErrorDetail(Id recordId, List<Database.Error> errors) {
+        List<String> messages    = new List<String>();
+        List<String> statusCodes = new List<String>();
+        List<String> fields      = new List<String>();
+
+        for (Database.Error err : errors) {
+            messages.add(err.getMessage());
+            statusCodes.add(err.getStatusCode().name());
+            if (!err.getFields().isEmpty()) {
+                fields.add(String.join(err.getFields(), ', '));
+            }
+        }
+        return new Map<String, Object>{
+            'recordId'    => recordId,
+            'messages'    => messages,
+            'statusCodes' => statusCodes,
+            'fields'      => fields
+        };
+    }
+
+    private static void persistLog(
+        String typeName,
+        String operation,
+        List<SObject> failedRecords,
+        List<Map<String, Object>> errorDetails
+    ) {
+        Error_Log__c log = new Error_Log__c(
+            Object_Type__c = typeName,
+            Operation__c   = operation,
+            Error_Count__c = failedRecords.size(),
+            Status__c      = 'Open'
+        );
+        Database.SaveResult logResult = Database.insert(log, false);
+        if (!logResult.isSuccess()) {
+            System.debug(LoggingLevel.ERROR, 'DmlService: failed to insert Error_Log__c: ' + logResult.getErrors());
+            return;
+        }
+        attachPayload(log.Id, failedRecords, errorDetails);
+    }
+
+    private static void attachPayload(
+        Id logId,
+        List<SObject> failedRecords,
+        List<Map<String, Object>> errorDetails
+    ) {
+        Map<String, Object> payload = new Map<String, Object>{
+            'records' => failedRecords,
+            'errors'  => errorDetails
+        };
+        ContentVersion cv = new ContentVersion(
+            Title          = 'error_payload',
+            PathOnClient   = 'error_payload.json',
+            VersionData    = Blob.valueOf(JSON.serialize(payload)),
+            IsMajorVersion = true
+        );
+        Database.SaveResult cvResult = Database.insert(cv, false);
+        if (!cvResult.isSuccess()) {
+            System.debug(LoggingLevel.ERROR, 'DmlService: failed to insert ContentVersion: ' + cvResult.getErrors());
+            return;
+        }
+        ContentVersion inserted = [SELECT ContentDocumentId FROM ContentVersion WHERE Id = :cvResult.getId()];
+        ContentDocumentLink cdl = new ContentDocumentLink(
+            LinkedEntityId    = logId,
+            ContentDocumentId = inserted.ContentDocumentId,
+            ShareType         = 'V'
+        );
+        Database.insert(cdl, false);
     }
 
     private static String resolveTypeName(SObject record, Map<Schema.SObjectType, String> typeCache) {
@@ -116,40 +218,5 @@ public without sharing class DmlService {
             typeCache.put(soType, soType.getDescribe().getName());
         }
         return typeCache.get(soType);
-    }
-
-    private static Error_Log__c buildLog(
-        SObject record,
-        String typeName,
-        List<Database.Error> errors,
-        String operation
-    ) {
-        List<String> messages = new List<String>();
-        List<String> codes    = new List<String>();
-        List<String> fields   = new List<String>();
-
-        for (Database.Error err : errors) {
-            messages.add(err.getMessage());
-            codes.add(err.getStatusCode().name());
-            if (!err.getFields().isEmpty()) {
-                fields.add(String.join(err.getFields(), ', '));
-            }
-        }
-
-        return new Error_Log__c(
-            Object_Type__c   = typeName,
-            Record_Id__c     = record.Id,
-            Operation__c     = operation,
-            Error_Message__c = String.join(messages, '\n'),
-            Status_Code__c   = String.join(codes, '\n'),
-            Fields__c        = String.join(fields, '\n')
-        );
-    }
-
-    private static void persistLogs(List<Error_Log__c> logs) {
-        if (logs.isEmpty()) {
-            return;
-        }
-        Database.insert(logs, false);
     }
 }
