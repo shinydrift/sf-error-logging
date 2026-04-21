@@ -25,28 +25,27 @@ Salesforce DX project providing a reusable DML utility (`DmlService`) that wraps
 
 ## Architecture decisions
 
-### `without sharing` — known issue
-`DmlService` is currently declared `without sharing`, which unintentionally bypasses sharing rules on all business DML, not just the log write. The intended fix (not yet applied) is:
-- Outer class: `inherited sharing`
-- Inner `LogWriter` class: `without sharing` (scoped only to `Error_Log__c` insert)
-
-Do not widen the `without sharing` scope further until this is resolved.
+### Sharing rules
+`DmlService` outer class is `inherited sharing` — business DML honours the caller's sharing context. The inner `LogWriter` class is `without sharing`, scoped only to `Error_Log__c`, `ContentVersion`, and `ContentDocumentLink` inserts so logs are always written regardless of the caller's context.
 
 ### Same-transaction logging
 `Error_Log__c` records are inserted in the same transaction as the failed business DML. This means logs are rolled back if the overall transaction fails later. This is a known trade-off — the alternative (Platform Events, Queueable Finalizer) is on the backlog.
 
 ### `allOrNone=true` does not log
-When `allOrNone=true`, Salesforce throws `DmlException` before returning results, so `logSaveFailures` never runs. Callers using `allOrNone=true` must handle the exception themselves and should not expect `Error_Log__c` records to be created.
+When `allOrNone=true`, Salesforce throws `DmlException` before returning results, so `processResults` never runs. Callers using `allOrNone=true` must handle the exception themselves and should not expect `Error_Log__c` records to be created. This is documented in the class-level Javadoc.
+
+### `recentLogIds`
+Populated by `LogWriter` after each successful log write. Call `DmlService.clearRecentLogIds()` before any operation whose log IDs you intend to inspect — it does not auto-clear between calls.
 
 ## Backlog items (from council review)
 
-1. Split `without sharing` — `inherited sharing` outer, `without sharing` inner `LogWriter`
-2. Add `Running_User__c`, `Stack_Trace__c`, `Transaction_Id__c` to `Error_Log__c`
-3. Truncate `Status_Code__c` to 255 chars before assignment
-4. Inspect `persistLogs` `SaveResult[]` and emit `System.debug(LoggingLevel.ERROR, ...)` on log failures
-5. `upsertRecords` overload accepting `Schema.SObjectField externalIdField`
-6. `Database.DMLOptions` support
-7. Platform Event fallback for durable error logging
+1. ~~Split `without sharing`~~ — done: `inherited sharing` outer, `without sharing` inner `LogWriter`
+2. ~~Add `Running_User__c`, `Stack_Trace__c`, `Transaction_Id__c` to `Error_Log__c`~~ — done; `Status_Code__c` also added
+3. ~~Truncate `Status_Code__c` to 255 chars before assignment~~ — done via `.left(255)` in `LogWriter`
+4. ~~Inspect log `SaveResult[]` and emit `System.debug(LoggingLevel.ERROR, ...)` on failures~~ — done for `Error_Log__c`, `ContentVersion`, and `ContentDocumentLink`
+5. ~~`upsertRecords` overload accepting `Schema.SObjectField externalIdField`~~ — done
+6. ~~`Database.DMLOptions` support~~ — done for `insertRecords` and `updateRecords`
+7. Platform Event fallback for durable error logging — still on backlog
 
 ## Authenticating
 
