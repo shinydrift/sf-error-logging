@@ -38,12 +38,17 @@ All methods return the standard `Database.*Result[]` array so callers can inspec
 |---|---|
 | `insertRecords(records)` | `Database.SaveResult[]` |
 | `insertRecords(records, allOrNone)` | `Database.SaveResult[]` |
+| `insertRecords(records, options)` | `Database.SaveResult[]` |
 | `updateRecords(records)` | `Database.SaveResult[]` |
 | `updateRecords(records, allOrNone)` | `Database.SaveResult[]` |
+| `updateRecords(records, options)` | `Database.SaveResult[]` |
 | `upsertRecords(records)` | `Database.UpsertResult[]` |
 | `upsertRecords(records, allOrNone)` | `Database.UpsertResult[]` |
+| `upsertRecords(records, externalIdField)` | `Database.UpsertResult[]` |
+| `upsertRecords(records, externalIdField, allOrNone)` | `Database.UpsertResult[]` |
 | `deleteRecords(records)` | `Database.DeleteResult[]` |
 | `deleteRecords(records, allOrNone)` | `Database.DeleteResult[]` |
+| `clearRecentLogIds()` | `void` |
 
 ---
 
@@ -57,8 +62,12 @@ Custom object — one record per `DmlService` method call that produced at least
 | `Object_Type__c` | Text(255) | SObject API name of the failed records |
 | `Operation__c` | Picklist | INSERT / UPDATE / UPSERT / DELETE |
 | `Error_Count__c` | Number | Count of records that failed in this call |
-| `Retry_Count__c` | Number | Number of retry attempts made (default 0) |
-| `Status__c` | Picklist | Open / Retry / Retrying / Resolved / Failed |
+| `Running_User__c` | Text(255) | Username of the user who triggered the DML |
+| `Stack_Trace__c` | LongTextArea | Apex stack trace at the point of failure |
+| `Transaction_Id__c` | Text(255) | Salesforce request/transaction ID |
+| `Status_Code__c` | Text(255) | First error status code from the failed records |
+| `Status__c` | Picklist | Open / Retry / Resolved / Failed |
+| `Parent_Log__c` | Lookup(Error_Log__c) | Links a retry's child log back to the original |
 
 #### JSON payload attachment
 
@@ -72,17 +81,17 @@ Set `Status__c = 'Retry'` on any `Error_Log__c` record to trigger an automatic r
 
 **How it works:**
 
-1. `ErrorLogTrigger` (after-update) detects the `Open → Retry` transition and enqueues `DmlRetryQueueable`.
-2. `DmlRetryQueueable` reads the attached JSON payload, deserialises the failed records, and re-runs the original operation through `DmlService`.
+1. `ErrorLogTrigger` (after-update) detects the `Open → Retry` transition and calls `ErrorLogRetryHandler.handleRetry()` synchronously in the same transaction.
+2. `ErrorLogRetryHandler` reads the attached JSON payload, deserialises the failed records, and re-runs the original operation through `DmlService`.
 3. The log status is updated:
    - All records succeed → `Resolved`
-   - Any record fails → `Failed`, `Retry_Count__c` incremented (new failures produce their own `Error_Log__c` records)
+   - Any record fails → `Failed` (new failures produce their own `Error_Log__c` records linked back via `Parent_Log__c`)
 
 ---
 
 ## Deployment
 
-Deploy `Error_Log__c`, `DmlService`, `DmlRetryQueueable`, and `ErrorLogTrigger` together:
+Deploy `Error_Log__c`, `DmlService`, `ErrorLogRetryHandler`, and `ErrorLogTrigger` together:
 
 ```bash
 sf project deploy start --source-dir force-app
@@ -102,16 +111,13 @@ sf org login sfdx-url -f <(echo "$SFDX_AUTH_URL") -a target-org -s
 ## Tests
 
 ```bash
-sf apex run test --class-names DmlServiceTest,DmlRetryQueueableTest --result-format human
+sf apex run test --class-names DmlServiceTest,ErrorLogRetryHandlerTest --result-format human
 ```
 
-- `DmlServiceTest` — happy path, partial failure, `allOrNone` propagation, and null input for all four operations
-- `DmlRetryQueueableTest` — retry lifecycle: `Resolved` on full success, `Failed` + retry count increment on continued failure, missing-payload guard
+- `DmlServiceTest` — happy path, partial failure, `allOrNone` propagation, `DMLOptions` overloads, external-ID upsert, `recentLogIds` population, and null input for all operations
+- `ErrorLogRetryHandlerTest` — retry lifecycle: `Resolved` on full success, `Failed` on continued failure, `Parent_Log__c` linking, missing-payload guard
 
 ## Known gaps / backlog
 
-- `Error_Log__c` does not capture caller context (user ID, stack trace, transaction ID) — useful for production debugging
 - `allOrNone=true` failures are not logged — `DmlException` propagates before log methods run
-- `without sharing` on `DmlService` bypasses sharing rules on business DML, not just log writes — should be split into `inherited sharing` outer class + `without sharing` inner log writer
-- No `Database.DMLOptions` or external-ID upsert overload
 - Logs created in the same transaction are rolled back if the transaction fails after the DML — consider Platform Events for durable logging
