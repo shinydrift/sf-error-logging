@@ -6,7 +6,7 @@ public with sharing class ErrorLogManagerController {
             SELECT ContentDocument.LatestPublishedVersion.VersionData
             FROM ContentDocumentLink
             WHERE LinkedEntityId = :logId
-            ORDER BY SystemModstamp DESC
+            ORDER BY Id DESC
             LIMIT 1
         ];
         if (links.isEmpty()) return null;
@@ -17,7 +17,11 @@ public with sharing class ErrorLogManagerController {
 
     @AuraEnabled
     public static void updatePayloadAndRetry(Id logId, String payloadJson) {
-        new RetryWriter().execute(logId, payloadJson);
+        try {
+            new RetryWriter().execute(logId, payloadJson);
+        } catch (Exception e) {
+            throw new AuraHandledException(e.getMessage());
+        }
     }
 
     // without sharing mirrors LogWriter — ContentDocumentLink inserts can fail
